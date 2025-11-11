@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+build/
+install/
+log/
+*.log
+
+# ROS2 / colcon
+.build/
+install/
+log/
+.rosinstall
+*.bag
+
+# OS / Editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
