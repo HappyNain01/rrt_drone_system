@@ -1,0 +1,36 @@
+/**:
+  ros__parameters:
+    # RRT Planner Parameters
+    rrt:
+      max_iterations: 3000
+      step_size: 0.5
+      goal_sample_rate: 0.1
+      goal_tolerance: 0.3
+    
+    # Occupancy Grid Parameters
+    occupancy:
+      grid_width: 200
+      grid_height: 200
+      resolution: 0.1
+      origin_x: -10.0
+      origin_y: -10.0
+      decay_rate: 0.95
+    
+    # Planning Parameters
+    planning:
+      rate: 2.0
+      goal_x: 5.0
+      goal_y: 0.0
+      goal_z: 2.0
+      bounds_xmin: -10.0
+      bounds_xmax: 10.0
+      bounds_ymin: -10.0
+      bounds_ymax: 10.0
+      bounds_zmin: 0.5
+      bounds_zmax: 5.0
+    
+    # Health Monitor Parameters
+    health:
+      check_rate: 10.0
+      lidar_timeout: 0.5
+      command_timeout: 2.0
