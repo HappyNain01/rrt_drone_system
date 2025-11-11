@@ -1,0 +1,21 @@
+/**:
+  ros__parameters:
+    fcu_url: /dev/ttyAMA0:57600
+    gcs_url: ""
+    target_system_id: 1
+    target_component_id: 1
+    
+    plugin_blacklist: []
+    plugin_whitelist:
+      - sys_status
+      - sys_time
+      - imu
+      - local_position
+      - global_position
+      - setpoint_position
+      - setpoint_velocity
+      - command
+    
+    conn:
+      heartbeat_rate: 1.0
+      timeout: 10.0
