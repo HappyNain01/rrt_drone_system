@@ -1,1 +1,0 @@
-/home/happy/rrt_workspace/build/rrt_drone/launch/pc_planner.launch.py

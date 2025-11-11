@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<dds>
+    <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+        <participant profile_name="discovery_client" is_default_profile="true">
+            <rtps>
+                <name>RaspberryPiClient</name>
+                <builtin>
+                    <discovery_config>
+                        <discoveryProtocol>CLIENT</discoveryProtocol>
+                        <discoveryServersList>
+                            <RemoteServer prefix="44.53.00.5f.45.50.52.4f.53.49.4d.41">
+                                <metatrafficUnicastLocatorList>
+                                    <locator>
+                                        <tcpv4>
+                                            <!-- ⚠️ Ground PC IP Address -->
+                                            <address>192.168.0.10</address>
+                                            <port>42100</port>
+                                        </tcpv4>
+                                    </locator>
+                                </metatrafficUnicastLocatorList>
+                            </RemoteServer>
+                        </discoveryServersList>
+                    </discovery_config>
+                </builtin>
+            </rtps>
+        </participant>
+    </profiles>
+</dds>

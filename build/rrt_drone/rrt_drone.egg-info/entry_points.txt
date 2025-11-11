@@ -1,3 +1,0 @@
-[console_scripts]
-path_planner = rrt_drone.nodes.path_planner_node:main
-
