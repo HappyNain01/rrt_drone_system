@@ -237,17 +237,56 @@ class OccupancyGridBuilder:
         return np.array(obs, dtype=float) if obs else np.empty((0, 2), dtype=float)
 
     def to_occupancy_grid_msg(self, frame_id: str = 'map') -> OccupancyGrid:
+        """
+        Convert internal uint8 grid (0-255) into ROS nav_msgs/OccupancyGrid format.
+        Mapping:
+            0        -> 0    (free)
+            1..50    -> -1   (unknown / low confidence)
+            >50      -> 100  (occupied)
+        NOTE: The node sets the header.stamp right before publishing.
+        """
         msg = OccupancyGrid()
+        # header.stamp is set by the caller (node) so we only set frame_id
         msg.header.frame_id = frame_id
-        msg.info.resolution = self.resolution
-        msg.info.width = self.width
-        msg.info.height = self.height
-        msg.info.origin.position.x = self.origin_x
-        msg.info.origin.position.y = self.origin_y
+
+        # Map metadata
+        msg.info.resolution = float(self.resolution)
+        msg.info.width = int(self.width)
+        msg.info.height = int(self.height)
+
+        # Set origin (position + identity orientation)
+        msg.info.origin.position.x = float(self.origin_x)
+        msg.info.origin.position.y = float(self.origin_y)
         msg.info.origin.position.z = 0.0
-        # flatten: row-major -> list
-        msg.data = self.grid.flatten().tolist()
+        msg.info.origin.orientation.x = 0.0
+        msg.info.origin.orientation.y = 0.0
+        msg.info.origin.orientation.z = 0.0
+        msg.info.origin.orientation.w = 1.0
+
+        # Convert internal grid (uint8 0..255) -> ROS occupancy values (-1,0,100)
+        # We iterate row-major (same order as numpy.flatten(order='C'))
+        flat = []
+        # Thresholds — tuned so faint detections become UNKNOWN, strong detections OCCUPIED
+        OCC_THRESHOLD = 50     # cell value > OCC_THRESHOLD => occupied
+        for row in range(self.height):
+            # iterate columns for row-major ordering
+            for col in range(self.width):
+                v = int(self.grid[row, col])  # 0..255
+                if v == 0:
+                    flat.append(0)      # free
+                elif v > OCC_THRESHOLD:
+                    flat.append(100)    # occupied
+                else:
+                    flat.append(-1)     # unknown / low confidence
+
+        # Ensure length matches width*height
+        if len(flat) != msg.info.width * msg.info.height:
+            # fallback: fill unknowns (shouldn't happen)
+            flat = [-1] * (msg.info.width * msg.info.height)
+
+        msg.data = flat
         return msg
+
 
 
 # ---------------------------
