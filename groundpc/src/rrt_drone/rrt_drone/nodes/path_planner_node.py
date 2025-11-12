@@ -1,185 +1,188 @@
 #!/usr/bin/env python3
 """
 Path Planner Node - Ground PC
-Distributed RRT path planning with obstacle avoidance
+Integrated RRT planner (KD-tree), MessageVerifier (CRC32), OccupancyGridBuilder.
+Place at: groundpc/src/rrt_drone/rrt_drone/nodes/path_planner_node.py
 """
+
+from __future__ import annotations
+
+import time
+import struct
+import binascii
+from typing import List, Tuple, Optional
+
+import numpy as np
+from scipy.spatial import cKDTree
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile
+
 from std_msgs.msg import Float32MultiArray
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
-import numpy as np
-from scipy.spatial import cKDTree
-import time
-import struct
-import binascii
 
-# -------------------------------------------------------------------
-# CLASS: MessageVerifier
-# -------------------------------------------------------------------
-# Source: message_verifier_class.py
-# -------------------------------------------------------------------
+# ---------------------------
+# MessageVerifier (CRC32)
+# ---------------------------
+# (from message_verifier_class.py). :contentReference[oaicite:3]{index=3}
 class MessageVerifier:
-    """
-    Message integrity verification using CRC32 checksum
-    Detects corrupted messages over WiFi
-    """
-    
+    """Message integrity verification using CRC32 checksum."""
+
     @staticmethod
-    def pack_with_crc(data_list):
-        """
-        Pack float list with CRC32 checksum
-        
-        Args:
-            data_list: List of floats to pack
-        
-        Returns:
-            (packed_data, crc): Tuple of packed bytes and CRC value
-        """
-        # Pack all floats as doubles (8 bytes each)
-        packed = struct.pack(f'{len(data_list)}d', *data_list)
-        
-        # Calculate CRC32
+    def pack_with_crc(data_list: List[float]) -> Tuple[bytes, int]:
+        packed = struct.pack(f'{len(data_list)}d', *[float(x) for x in data_list])
         crc = binascii.crc32(packed) & 0xFFFFFFFF
-        
         return packed, crc
-    
+
     @staticmethod
-    def verify_crc(data_list, received_crc):
-        """
-        Verify CRC of received message
-        
-        Args:
-            data_list: Received float list (without CRC)
-            received_crc: Received CRC value
-        
-        Returns:
-            bool: True if CRC matches, False otherwise
-        """
-        # Pack data
-        packed = struct.pack(f'{len(data_list)}d', *data_list)
-        
-        # Calculate CRC
+    def verify_crc(data_list: List[float], received_crc: int) -> bool:
+        packed = struct.pack(f'{len(data_list)}d', *[float(x) for x in data_list])
         calculated_crc = binascii.crc32(packed) & 0xFFFFFFFF
-        
-        # Compare
         return calculated_crc == int(received_crc)
-    
+
     @staticmethod
-    def calculate_crc(data_list):
-        """
-        Calculate CRC for a list of floats
-        
-        Args:
-            data_list: List of floats
-        
-        Returns:
-            int: CRC32 value
-        """
-        packed = struct.pack(f'{len(data_list)}d', *data_list)
+    def calculate_crc(data_list: List[float]) -> int:
+        packed = struct.pack(f'{len(data_list)}d', *[float(x) for x in data_list])
         return binascii.crc32(packed) & 0xFFFFFFFF
 
-# -------------------------------------------------------------------
-# CLASS: RRTPlanner
-# -------------------------------------------------------------------
-# Source: path_planner_complete.py
-# -------------------------------------------------------------------
+
+# ---------------------------
+# RRTPlanner (KD-tree optimized)
+# ---------------------------
+# Adapted from rrt_planner_complete.py. :contentReference[oaicite:4]{index=4}
 class RRTPlanner:
-    """RRT path planning algorithm with KD-tree optimization"""
-    
-    def __init__(self, max_iter=2000, step_size=0.6, goal_tolerance=0.3):
-        self.max_iter = max_iter
-        self.step_size = step_size
-        self.goal_tolerance = goal_tolerance
-        
-    def plan(self, start, goal, obstacles):
+    """
+    Rapidly-exploring Random Tree path planner
+    Optimized with KD-tree for fast nearest-neighbor queries.
+    """
+
+    def __init__(self,
+                 max_iterations: int = 3000,
+                 step_size: float = 0.5,
+                 goal_bias: float = 0.1,
+                 goal_tolerance: float = 0.3,
+                 safety_margin: float = 0.5):
+        self.max_iterations = int(max_iterations)
+        self.step_size = float(step_size)
+        self.goal_bias = float(goal_bias)
+        self.goal_tolerance = float(goal_tolerance)
+        self.safety_margin = float(safety_margin)
+
+    def plan(self,
+             start: Tuple[float, float],
+             goal: Tuple[float, float],
+             occupancy_grid: np.ndarray,
+             bounds: Tuple[float, float, float, float]) -> Optional[List[Tuple[float, float]]]:
         """
-        Plan path from start to goal avoiding obstacles
-        
-        Args:
-            start: [x, y] starting position
-            goal: [x, y] goal position
-            obstacles: numpy array of obstacle positions [[x1,y1], [x2,y2], ...]
-        
-        Returns:
-            path: list of waypoints [[x1,y1], [x2,y2], ...] or None if no path found
+        Plans a 2D path (x,y) from start -> goal using RRT avoiding occupied cells.
+        occupancy_grid: 2D numpy array (height, width) with occupancy values 0-255.
+        bounds: (xmin, xmax, ymin, ymax)
+        Returns list of 2D points or None.
         """
-        # Build obstacle KD-tree for fast collision checking
-        if len(obstacles) > 0:
-            obstacle_tree = cKDTree(obstacles)
-        else:
-            obstacle_tree = None
-        
-        # Initialize tree with start node
+        start = np.array(start, dtype=float)
+        goal = np.array(goal, dtype=float)
+
+        # quick success check
+        if np.linalg.norm(goal - start) < self.goal_tolerance:
+            return [tuple(start), tuple(goal)]
+
+        # extract obstacles (world coords) from occupancy grid
+        obstacles = self._extract_obstacles(occupancy_grid, bounds)
+
+        obstacle_tree = cKDTree(obstacles) if obstacles.size else None
+
+        # check start/goal collisions
+        if obstacle_tree is not None:
+            d_s, _ = obstacle_tree.query(start)
+            d_g, _ = obstacle_tree.query(goal)
+            if d_s < self.safety_margin or d_g < self.safety_margin:
+                return None
+
         nodes = [start]
-        parents = [-1]  # Parent indices
-        
-        for i in range(self.max_iter):
-            # Sample random point (with goal bias)
-            if np.random.rand() < 0.1:  # 10% goal bias
-                rand_point = goal
+        parents = [-1]
+
+        # main loop
+        for it in range(self.max_iterations):
+            if np.random.rand() < self.goal_bias:
+                sample = goal
             else:
-                # Sample in workspace bounds [-10, 10] x [-10, 10]
-                rand_point = np.random.uniform(-10, 10, 2)
-            
-            # Find nearest node in tree
-            dists = np.linalg.norm(np.array(nodes) - rand_point, axis=1)
-            nearest_idx = np.argmin(dists)
+                sample = self._sample_random_point(bounds)
+
+            # nearest via KD-tree on nodes
+            if len(nodes) < 50:
+                dists = np.linalg.norm(np.stack(nodes) - sample, axis=1)
+                nearest_idx = int(np.argmin(dists))
+            else:
+                tree_nodes = cKDTree(np.stack(nodes))
+                _, nearest_idx = tree_nodes.query(sample)
+
             nearest = nodes[nearest_idx]
-            
-            # Steer from nearest towards random point
-            direction = rand_point - nearest
-            distance = np.linalg.norm(direction)
-            
-            if distance > self.step_size:
-                new_point = nearest + (direction / distance) * self.step_size
+            vec = sample - nearest
+            dist = np.linalg.norm(vec)
+            if dist == 0:
+                continue
+            if dist > self.step_size:
+                new_pt = nearest + (vec / dist) * self.step_size
             else:
-                new_point = rand_point
-            
-            # Collision check
-            if obstacle_tree is not None:
-                dist_to_obstacle, _ = obstacle_tree.query(new_point)
-                if dist_to_obstacle < 0.5:  # 0.5m safety margin
-                    continue
-                
-                # Check path from nearest to new_point for collisions
-                path_points = self._interpolate_path(nearest, new_point, 0.1)
-                if self._path_in_collision(path_points, obstacle_tree, 0.5):
-                    continue
-            
-            # Add to tree
-            nodes.append(new_point)
+                new_pt = sample
+
+            # collision free?
+            if not self._is_collision_free(nearest, new_pt, obstacle_tree):
+                continue
+
+            nodes.append(new_pt)
             parents.append(nearest_idx)
-            
-            # Check if goal reached
-            if np.linalg.norm(new_point - goal) < self.goal_tolerance:
-                # Extract path by backtracking through parents
-                path = self._extract_path(nodes, parents, len(nodes) - 1)
-                return path
-        
-        # No path found within iteration limit
+
+            # reached goal?
+            if np.linalg.norm(new_pt - goal) < self.goal_tolerance:
+                path_nodes = self._extract_path(nodes, parents, len(nodes) - 1)
+                return [tuple(p) for p in path_nodes]
+
         return None
-    
-    def _interpolate_path(self, start, end, resolution):
-        """Generate points along line from start to end"""
-        distance = np.linalg.norm(end - start)
-        num_points = int(distance / resolution) + 1
-        points = []
-        for i in range(num_points):
-            alpha = i / max(num_points - 1, 1)
-            point = start + alpha * (end - start)
-            points.append(point)
-        return np.array(points)
-    
-    def _path_in_collision(self, path_points, obstacle_tree, margin):
-        """Check if any point on path is too close to obstacles"""
-        dists, _ = obstacle_tree.query(path_points)
-        return np.any(dists < margin)
-    
-    def _extract_path(self, nodes, parents, goal_idx):
-        """Extract path from tree by following parent links"""
+
+    def _extract_obstacles(self, grid: np.ndarray, bounds: Tuple[float, float, float, float]) -> np.ndarray:
+        xmin, xmax, ymin, ymax = bounds
+        height, width = grid.shape
+        occupied = np.argwhere(grid > 127)  # threshold
+        if occupied.size == 0:
+            return np.empty((0, 2), dtype=float)
+
+        # occupied: array of [row, col] => convert to x,y world
+        obstacles = []
+        for row, col in occupied:
+            x = xmin + (col + 0.5) * ((xmax - xmin) / width)
+            y = ymin + (row + 0.5) * ((ymax - ymin) / height)
+            obstacles.append([x, y])
+        return np.array(obstacles, dtype=float)
+
+    def _sample_random_point(self, bounds: Tuple[float, float, float, float]) -> np.ndarray:
+        xmin, xmax, ymin, ymax = bounds
+        return np.array([np.random.uniform(xmin, xmax), np.random.uniform(ymin, ymax)], dtype=float)
+
+    def _is_collision_free(self, p1: np.ndarray, p2: np.ndarray, obstacle_tree: Optional[cKDTree]) -> bool:
+        if obstacle_tree is None:
+            return True
+
+        # quick endpoint check
+        d, _ = obstacle_tree.query(p2)
+        if d < self.safety_margin:
+            return False
+
+        # sample along segment
+        seg_len = np.linalg.norm(p2 - p1)
+        checks = max(int(seg_len / 0.1), 1)
+        for i in range(1, checks + 1):
+            alpha = i / checks
+            pt = p1 + alpha * (p2 - p1)
+            d, _ = obstacle_tree.query(pt)
+            if d < self.safety_margin:
+                return False
+        return True
+
+    def _extract_path(self, nodes: List[np.ndarray], parents: List[int], goal_idx: int) -> List[np.ndarray]:
         path = []
         idx = goal_idx
         while idx != -1:
@@ -188,70 +191,52 @@ class RRTPlanner:
         path.reverse()
         return path
 
-# -------------------------------------------------------------------
-# CLASS: OccupancyGridBuilder
-# -------------------------------------------------------------------
-# Source: path_planner_complete.py
-# -------------------------------------------------------------------
+
+# ---------------------------
+# OccupancyGridBuilder
+# ---------------------------
+# Adapted from your path_planner_complete.py. :contentReference[oaicite:5]{index=5}
 class OccupancyGridBuilder:
-    """Build 2D occupancy grid from LiDAR scans"""
-    
-    def __init__(self, width=200, height=200, resolution=0.1, origin_x=-10.0, origin_y=-10.0):
-        self.width = width
-        self.height = height
-        self.resolution = resolution
-        self.origin_x = origin_x
-        self.origin_y = origin_y
-        self.grid = np.zeros((height, width), dtype=np.int8)
-        
-    def update_from_scan(self, scan, robot_pose):
-        """
-        Update grid from LaserScan message
-        
-        Args:
-            scan: LaserScan message
-            robot_pose: [x, y, yaw] robot position and orientation
-        """
-        # Decay existing occupancy (dynamic obstacles)
-        self.grid = (self.grid * 0.95).astype(np.int8)
-        
-        # Add new scan data
+    def __init__(self, width: int = 200, height: int = 200, resolution: float = 0.1,
+                 origin_x: float = -10.0, origin_y: float = -10.0, decay_rate: float = 0.95):
+        self.width = int(width)
+        self.height = int(height)
+        self.resolution = float(resolution)
+        self.origin_x = float(origin_x)
+        self.origin_y = float(origin_y)
+        self.decay_rate = float(decay_rate)
+        self.grid = np.zeros((self.height, self.width), dtype=np.uint8)
+
+    def update_from_scan(self, scan: LaserScan, robot_pose: Tuple[float, float, float]):
+        # decay
+        self.grid = (self.grid.astype(np.float32) * self.decay_rate).astype(np.uint8)
+
         angle = scan.angle_min
         for r in scan.ranges:
-            if scan.range_min < r < scan.range_max:
-                # Convert polar to Cartesian in robot frame
+            if np.isfinite(r) and scan.range_min < r < scan.range_max:
                 x_robot = r * np.cos(angle)
                 y_robot = r * np.sin(angle)
-                
-                # Transform to world frame
+                # world
                 x_world = robot_pose[0] + x_robot * np.cos(robot_pose[2]) - y_robot * np.sin(robot_pose[2])
                 y_world = robot_pose[1] + x_robot * np.sin(robot_pose[2]) + y_robot * np.cos(robot_pose[2])
-                
-                # Convert to grid coordinates
+
                 grid_x = int((x_world - self.origin_x) / self.resolution)
                 grid_y = int((y_world - self.origin_y) / self.resolution)
-                
-                # Mark as occupied
+
                 if 0 <= grid_x < self.width and 0 <= grid_y < self.height:
-                    self.grid[grid_y, grid_x] = 100  # Occupied
-            
+                    self.grid[grid_y, grid_x] = min(255, int(self.grid[grid_y, grid_x]) + 50)
             angle += scan.angle_increment
-    
-    def get_obstacles(self):
-        """Get list of obstacle positions from grid"""
-        obstacles = []
-        occupied_cells = np.argwhere(self.grid > 50)  # Threshold at 50%
-        
-        for cell in occupied_cells:
-            # Convert grid coords to world coords
-            x = cell[1] * self.resolution + self.origin_x
-            y = cell[0] * self.resolution + self.origin_y
-            obstacles.append([x, y])
-        
-        return np.array(obstacles) if obstacles else np.array([])
-    
-    def to_occupancy_grid_msg(self, frame_id='map'):
-        """Convert to ROS OccupancyGrid message"""
+
+    def get_obstacles(self) -> np.ndarray:
+        occupied = np.argwhere(self.grid > 50)
+        obs = []
+        for row, col in occupied:
+            x = col * self.resolution + self.origin_x
+            y = row * self.resolution + self.origin_y
+            obs.append([x, y])
+        return np.array(obs, dtype=float) if obs else np.empty((0, 2), dtype=float)
+
+    def to_occupancy_grid_msg(self, frame_id: str = 'map') -> OccupancyGrid:
         msg = OccupancyGrid()
         msg.header.frame_id = frame_id
         msg.info.resolution = self.resolution
@@ -260,192 +245,196 @@ class OccupancyGridBuilder:
         msg.info.origin.position.x = self.origin_x
         msg.info.origin.position.y = self.origin_y
         msg.info.origin.position.z = 0.0
+        # flatten: row-major -> list
         msg.data = self.grid.flatten().tolist()
         return msg
 
-# -------------------------------------------------------------------
-# CLASS: PathPlannerNode (Main Node)
-# -------------------------------------------------------------------
-# Source: path_planner_complete.py
-# MODIFIED: Removed grid publisher, added CRC
-# -------------------------------------------------------------------
+
+# ---------------------------
+# PathPlannerNode
+# ---------------------------
 class PathPlannerNode(Node):
-    """Main path planning node for Ground PC"""
-    
     def __init__(self):
         super().__init__('path_planner')
-        
-        # Declare parameters
+
+        # Parameters (match YAML keys)
+        self.declare_parameter('rrt.max_iterations', 3000)
+        self.declare_parameter('rrt.step_size', 0.5)
+        self.declare_parameter('rrt.goal_sample_rate', 0.1)
+        self.declare_parameter('rrt.goal_tolerance', 0.3)
+        self.declare_parameter('planning.rate', 2.0)
         self.declare_parameter('planning.goal_x', 5.0)
         self.declare_parameter('planning.goal_y', 0.0)
         self.declare_parameter('planning.goal_z', 2.0)
-        self.declare_parameter('planning.rate', 1.5)
-        self.declare_parameter('rrt.max_iterations', 2000)
-        self.declare_parameter('rrt.step_size', 0.6)
-        self.declare_parameter('rrt.goal_sample_rate', 0.15)
-        self.declare_parameter('rrt.goal_tolerance', 0.3)
         self.declare_parameter('occupancy.grid_width', 200)
         self.declare_parameter('occupancy.grid_height', 200)
         self.declare_parameter('occupancy.resolution', 0.1)
         self.declare_parameter('occupancy.origin_x', -10.0)
         self.declare_parameter('occupancy.origin_y', -10.0)
-        
-        # Get parameters
-        self.goal_x = self.get_parameter('planning.goal_x').value
-        self.goal_y = self.get_parameter('planning.goal_y').value
-        self.goal_z = self.get_parameter('planning.goal_z').value
-        planning_rate = self.get_parameter('planning.rate').value
-        
-        max_iter = self.get_parameter('rrt.max_iterations').value
-        step_size = self.get_parameter('rrt.step_size').value
-        goal_tol = self.get_parameter('rrt.goal_tolerance').value
-        
-        grid_w = self.get_parameter('occupancy.grid_width').value
-        grid_h = self.get_parameter('occupancy.grid_height').value
-        resolution = self.get_parameter('occupancy.resolution').value
-        origin_x = self.get_parameter('occupancy.origin_x').value
-        origin_y = self.get_parameter('occupancy.origin_y').value
-        
-        # Initialize components
-        self.rrt = RRTPlanner(max_iter, step_size, goal_tol)
-        self.grid_builder = OccupancyGridBuilder(grid_w, grid_h, resolution, origin_x, origin_y)
-        
+        self.declare_parameter('occupancy.decay_rate', 0.95)
+        self.declare_parameter('health.check_rate', 10.0)
+
+        # Read parameters
+        max_iter = int(self.get_parameter('rrt.max_iterations').value)
+        step_size = float(self.get_parameter('rrt.step_size').value)
+        goal_tol = float(self.get_parameter('rrt.goal_tolerance').value)
+        rate = float(self.get_parameter('planning.rate').value)
+
+        grid_w = int(self.get_parameter('occupancy.grid_width').value)
+        grid_h = int(self.get_parameter('occupancy.grid_height').value)
+        resolution = float(self.get_parameter('occupancy.resolution').value)
+        origin_x = float(self.get_parameter('occupancy.origin_x').value)
+        origin_y = float(self.get_parameter('occupancy.origin_y').value)
+        decay_rate = float(self.get_parameter('occupancy.decay_rate').value)
+
+        # Components
+        self.rrt = RRTPlanner(max_iterations=max_iter, step_size=step_size,
+                              goal_bias=float(self.get_parameter('rrt.goal_sample_rate').value),
+                              goal_tolerance=goal_tol)
+        self.grid_builder = OccupancyGridBuilder(width=grid_w, height=grid_h,
+                                                 resolution=resolution,
+                                                 origin_x=origin_x, origin_y=origin_y,
+                                                 decay_rate=decay_rate)
+
         # State
-        self.current_pose = None  # [x, y, yaw]
-        self.last_scan = None
+        self.current_pose: Optional[Tuple[float, float, float]] = None
+        self.last_scan: Optional[LaserScan] = None
         self.path_sequence = 0
-        
+
         # Subscribers
-        self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
-        self.create_subscription(PoseStamped, '/mavros/local_position/pose', self.pose_callback, 10)
-        self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
-        
+        self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
+        self.create_subscription(PoseStamped, '/mavros/local_position/pose', self._pose_cb, 10)
+        self.create_subscription(PoseStamped, '/goal_pose', self._goal_cb, 10)
+
         # Publishers
         self.path_pub = self.create_publisher(Float32MultiArray, '/path_commands', 10)
-        
-        # --- Visualization Publisher REMOVED as requested ---
-        # self.grid_pub = self.create_publisher(OccupancyGrid, '/occupancy_grid', 10)
-        
-        # Timer for periodic planning
-        plan_period = 1.0 / planning_rate
-        self.create_timer(plan_period, self.plan_callback)
-        
-        self.get_logger().info(f'Path Planner initialized')
-        self.get_logger().info(f'  Goal: ({self.goal_x:.2f}, {self.goal_y:.2f}, {self.goal_z:.2f})')
-        self.get_logger().info(f'  RRT: max_iter={max_iter}, step={step_size:.2f}m')
-        self.get_logger().info(f'  Grid: {grid_w}x{grid_h} @ {resolution:.2f}m/cell')
-        self.get_logger().info(f'  Planning rate: {planning_rate:.1f} Hz')
-    
-    def scan_callback(self, msg):
-        """Store latest LiDAR scan"""
+        self.grid_pub = self.create_publisher(OccupancyGrid, '/occupancy_grid', 10)
+
+        # Timer
+        self.create_timer(1.0 / rate, self._plan_cycle)
+
+        self.get_logger().info('Path Planner initialized.')
+        self.get_logger().info(f'Grid {grid_w}x{grid_h} @ {resolution}m')
+
+    # ---------------------------
+    # Callbacks
+    # ---------------------------
+    def _scan_cb(self, msg: LaserScan):
         self.last_scan = msg
-    
-    def pose_callback(self, msg):
-        """Store current robot pose"""
-        # Extract position
+
+    def _pose_cb(self, msg: PoseStamped):
         x = msg.pose.position.x
         y = msg.pose.position.y
-        
-        # Extract yaw from quaternion
-        qw = msg.pose.orientation.w
-        qz = msg.pose.orientation.z
-        yaw = 2.0 * np.arctan2(qz, qw)
-        
-        self.current_pose = [x, y, yaw]
-    
-    def goal_callback(self, msg):
-        """Handle new goal"""
-        self.goal_x = msg.pose.position.x
-        self.goal_y = msg.pose.position.y
-        self.goal_z = msg.pose.position.z
-        self.get_logger().info(f'New goal received: ({self.goal_x:.2f}, {self.goal_y:.2f}, {self.goal_z:.2f})')
-    
-    def plan_callback(self):
-        """Main planning loop - called at planning rate"""
-        # Check prerequisites
+        # yaw extraction (safe)
+        q = msg.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = float(np.arctan2(siny_cosp, cosy_cosp))
+        self.current_pose = (float(x), float(y), yaw)
+
+    def _goal_cb(self, msg: PoseStamped):
+        self.get_logger().info('Received external goal')
+        self.declare_parameter('planning.goal_x', msg.pose.position.x)
+        self.declare_parameter('planning.goal_y', msg.pose.position.y)
+        self.declare_parameter('planning.goal_z', msg.pose.position.z)
+
+    # ---------------------------
+    # Planning cycle
+    # ---------------------------
+    def _plan_cycle(self):
+        # prerequisites
         if self.current_pose is None:
             self.get_logger().warn('Waiting for robot pose...', throttle_duration_sec=5.0)
             return
-        
         if self.last_scan is None:
-            self.get_logger().warn('Waiting for LiDAR scan...', throttle_duration_sec=5.0)
+            self.get_logger().warn('Waiting for LiDAR...', throttle_duration_sec=5.0)
             return
-        
-        # Update occupancy grid
+
+        # update grid
         self.grid_builder.update_from_scan(self.last_scan, self.current_pose)
         obstacles = self.grid_builder.get_obstacles()
-        
-        # --- Visualization Publisher REMOVED as requested ---
-        # grid_msg = self.grid_builder.to_occupancy_grid_msg()
-        # grid_msg.header.stamp = self.get_clock().now().to_msg()
-        # self.grid_pub.publish(grid_msg)
-        
-        # Check if already at goal
-        start_2d = np.array(self.current_pose[:2])
-        goal_2d = np.array([self.goal_x, self.goal_y])
-        dist_to_goal = np.linalg.norm(goal_2d - start_2d)
-        
-        if dist_to_goal < 0.3:
+
+        # occupancy msg (optional viz)
+        try:
+            grid_msg = self.grid_builder.to_occupancy_grid_msg()
+            grid_msg.header.stamp = self.get_clock().now().to_msg()
+            self.grid_pub.publish(grid_msg)
+        except Exception:
+            # visualization optional — ignore if conversion fails
+            pass
+
+        # prepare planning inputs
+        start = (self.current_pose[0], self.current_pose[1])
+        goal_x = float(self.get_parameter('planning.goal_x').value)
+        goal_y = float(self.get_parameter('planning.goal_y').value)
+        goal = (goal_x, goal_y)
+
+        # bounds derived from occupancy grid
+        xmin = float(self.get_parameter('occupancy.origin_x').value)
+        ymin = float(self.get_parameter('occupancy.origin_y').value)
+        xmax = xmin + self.grid_builder.width * self.grid_builder.resolution
+        ymax = ymin + self.grid_builder.height * self.grid_builder.resolution
+        bounds = (xmin, xmax, ymin, ymax)
+
+        # quick check
+        dist = np.linalg.norm(np.array(goal) - np.array(start))
+        if dist < float(self.get_parameter('rrt.goal_tolerance').value):
             self.get_logger().info('Already at goal', throttle_duration_sec=5.0)
             return
-        
-        # Plan path using RRT
-        start_time = time.time()
-        path = self.rrt.plan(start_2d, goal_2d, obstacles)
-        planning_time = time.time() - start_time
-        
+
+        t0 = time.time()
+        path = self.rrt.plan(start, goal, self.grid_builder.grid, bounds)
+        t_elap = time.time() - t0
+
         if path is None:
-            self.get_logger().warn(f'No path found after {planning_time:.3f}s')
+            self.get_logger().warn(f'No path found (t={t_elap:.3f}s)')
             return
-        
-        # Log success
-        self.get_logger().info(f'Path found: {len(path)} waypoints in {planning_time:.3f}s')
-        
-        # Publish path
-        self.publish_path(path)
-    
-    def publish_path(self, path):
-        """Publish path as Float32MultiArray"""
+
+        self.get_logger().info(f'Path found: {len(path)} waypoints in {t_elap:.3f}s')
+
+        # publish path (append CRC)
+        self._publish_path(path)
+
+    # ---------------------------
+    # Publish with CRC appended
+    # ---------------------------
+    def _publish_path(self, path: List[Tuple[float, float]]):
+        # Format: [seq, timestamp, num_waypoints, x1,y1,z1, x2,y2,z2, ..., CRC]
+        data: List[float] = []
+        data.append(float(self.path_sequence))
+        data.append(float(self.get_clock().now().nanoseconds) / 1e9)
+        data.append(float(len(path)))
+
+        # append waypoints; z uses planning.goal_z
+        goal_z = float(self.get_parameter('planning.goal_z').value)
+        for (x, y) in path:
+            data.extend([float(x), float(y), float(goal_z)])
+
+        # compute CRC (pack as doubles)
+        _, crc = MessageVerifier.pack_with_crc(data)
+        data.append(float(crc))
+
         msg = Float32MultiArray()
-        
-        # Header: [sequence, timestamp, num_waypoints]
-        # Data payload starts here for CRC calculation
-        data_payload = [
-            float(self.path_sequence),
-            self.get_clock().now().nanoseconds / 1e9,
-            float(len(path))
-        ]
-        
-        # Waypoints: [x1, y1, z1, x2, y2, z2, ...]
-        for waypoint in path:
-            data_payload.extend([
-                float(waypoint[0]),
-                float(waypoint[1]),
-                float(self.goal_z)
-            ])
-        
-        # --- CRC LOGIC ADDED ---
-        # Calculate CRC on the data payload
-        crc = MessageVerifier.calculate_crc(data_payload)
-        
-        # Create final message: [data_payload, crc]
-        final_data = data_payload
-        final_data.append(float(crc))
-        
-        msg.data = final_data
+        msg.data = [float(x) for x in data]
         self.path_pub.publish(msg)
-        
         self.path_sequence += 1
 
-# -------------------------------------------------------------------
-# FUNCTION: main
-# -------------------------------------------------------------------
-# Source: path_planner_complete.py
-# -------------------------------------------------------------------
+    # ---------------------------
+    # Shutdown
+    # ---------------------------
+    def destroy_node(self):
+        try:
+            super().destroy_node()
+        except Exception:
+            pass
+
+
+# ---------------------------
+# Main
+# ---------------------------
 def main(args=None):
     rclpy.init(args=args)
     node = PathPlannerNode()
-    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
