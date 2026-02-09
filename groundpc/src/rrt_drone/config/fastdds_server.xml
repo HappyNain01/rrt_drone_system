@@ -12,7 +12,7 @@
                                 <metatrafficUnicastLocatorList>
                                     <locator>
                                         <tcpv4>
-                                            <address>192.168.1.100</address>
+                                            <address>192.168.0.100</address>
                                             <port>42100</port>
                                         </tcpv4>
                                     </locator>
