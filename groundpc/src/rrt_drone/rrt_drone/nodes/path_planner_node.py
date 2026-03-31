@@ -17,9 +17,13 @@ from scipy.spatial import cKDTree
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
+import rclpy.parameter
 
-from std_msgs.msg import Float32MultiArray
+from rclpy.qos import (QoSProfile, QoSHistoryPolicy,
+                        QoSReliabilityPolicy, QoSDurabilityPolicy,
+                        QoSLivelinessPolicy)
+
+from std_msgs.msg import Float64MultiArray
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
@@ -346,8 +350,28 @@ class PathPlannerNode(Node):
         self.create_subscription(PoseStamped, '/goal_pose', self._goal_cb, 10)
 
         # Publishers
-        self.path_pub = self.create_publisher(Float32MultiArray, '/path_commands', 10)
+        qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            liveliness=QoSLivelinessPolicy.AUTOMATIC,
+            liveliness_lease_duration=rclpy.duration.Duration(seconds=1.0)
+        )
+        self.path_pub = self.create_publisher(Float64MultiArray, '/path_commands', qos)
         self.grid_pub = self.create_publisher(OccupancyGrid, '/occupancy_grid', 10)
+
+        # Fix #7 - track pending ACKs for retransmission
+        self.pending_acks = {}
+        self.ack_timeout  = 0.5
+
+        # Subscribe to ACKs from RPi
+        self.create_subscription(
+            Float64MultiArray, '/path_command_ack',
+            self._ack_cb, 10)
+
+        # Retransmission check timer
+        self.create_timer(0.1, self._check_retransmissions)
 
         # Timer
         self.create_timer(1.0 / rate, self._plan_cycle)
@@ -373,9 +397,20 @@ class PathPlannerNode(Node):
 
     def _goal_cb(self, msg: PoseStamped):
         self.get_logger().info('Received external goal')
-        self.declare_parameter('planning.goal_x', msg.pose.position.x)
-        self.declare_parameter('planning.goal_y', msg.pose.position.y)
-        self.declare_parameter('planning.goal_z', msg.pose.position.z)
+        self.set_parameters([
+            rclpy.parameter.Parameter(
+                'planning.goal_x',
+                rclpy.parameter.Parameter.Type.DOUBLE,
+                float(msg.pose.position.x)),
+            rclpy.parameter.Parameter(
+                'planning.goal_y',
+                rclpy.parameter.Parameter.Type.DOUBLE,
+                float(msg.pose.position.y)),
+            rclpy.parameter.Parameter(
+                'planning.goal_z',
+                rclpy.parameter.Parameter.Type.DOUBLE,
+                float(msg.pose.position.z)),
+        ])
 
     # ---------------------------
     # Planning cycle
@@ -453,11 +488,47 @@ class PathPlannerNode(Node):
         _, crc = MessageVerifier.pack_with_crc(data)
         data.append(float(crc))
 
-        msg = Float32MultiArray()
+        msg = Float64MultiArray()
         msg.data = [float(x) for x in data]
+
+        # Fix #7 - track for retransmission
+        self.pending_acks[self.path_sequence] = {
+            'msg':       msg,
+            'timestamp': time.time(),
+            'attempts':  0,
+        }
+
         self.path_pub.publish(msg)
         self.path_sequence += 1
 
+    def _ack_cb(self, msg: Float64MultiArray):
+        """Fix #7 - mark command as acknowledged"""
+        if len(msg.data) < 1:
+            return
+        seq = int(msg.data[0])
+        if seq in self.pending_acks:
+            del self.pending_acks[seq]
+            self.get_logger().debug(f'ACK received for command {seq}')
+
+    def _check_retransmissions(self):
+        """Fix #7 - retransmit if no ACK within timeout"""
+        now = time.time()
+        to_remove = []
+        for seq, info in self.pending_acks.items():
+            if now - info['timestamp'] > self.ack_timeout:
+                if info['attempts'] < 3:
+                    self.path_pub.publish(info['msg'])
+                    info['timestamp'] = now
+                    info['attempts'] += 1
+                    self.get_logger().warn(
+                        f'Retransmitting command {seq} '
+                        f"(attempt {info['attempts']})")
+                else:
+                    self.get_logger().error(
+                        f'Command {seq} failed after 3 attempts')
+                    to_remove.append(seq)
+        for seq in to_remove:
+            del self.pending_acks[seq]
     # ---------------------------
     # Shutdown
     # ---------------------------
