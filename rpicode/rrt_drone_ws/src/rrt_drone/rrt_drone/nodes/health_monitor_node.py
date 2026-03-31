@@ -10,6 +10,7 @@ from rclpy.node import Node
 from std_msgs.msg import Bool, Float64MultiArray
 from sensor_msgs.msg import LaserScan
 from mavros_msgs.msg import State
+from mavros_msgs.srv import SetMode
 
 class HealthMonitorNode(Node):
     def __init__(self):
@@ -38,6 +39,11 @@ class HealthMonitorNode(Node):
         self.health_pub = self.create_publisher(Bool, '/system_healthy', 10)
         self.emergency_pub = self.create_publisher(Bool, '/emergency_status', 10)
         
+        # Timer
+        # SetMode service to trigger LAND
+        self.set_mode_client = self.create_client(
+            SetMode, '/mavros/set_mode')
+
         # Timer
         self.create_timer(1.0 / check_rate, self.check_health)
         
@@ -78,6 +84,17 @@ class HealthMonitorNode(Node):
         if not self.mavros_connected:
             self.get_logger().warn('MAVROS not connected')
             healthy = False
+
+        # Check CPU temperature
+        try:
+            with open('/sys/class/thermal/thermal_zone0/temp') as f:
+                temp = int(f.read().strip()) / 1000.0
+            if temp > 80.0:
+                self.get_logger().error(f'CPU overheating: {temp:.1f}C')
+                healthy = False
+                emergency = True
+        except Exception:
+            pass
         
         # Publish health status
         health_msg = Bool()
@@ -85,11 +102,18 @@ class HealthMonitorNode(Node):
         self.health_pub.publish(health_msg)
         
         # Publish emergency status
+        # Publish emergency status
         if emergency:
             emerg_msg = Bool()
             emerg_msg.data = True
             self.emergency_pub.publish(emerg_msg)
-            self.get_logger().error('EMERGENCY: Triggering emergency landing')
+            self.get_logger().fatal('EMERGENCY: Triggering LAND mode')
+
+            # Actually command the flight controller to land
+            if self.set_mode_client.wait_for_service(timeout_sec=1.0):
+                req = SetMode.Request()
+                req.custom_mode = 'LAND'
+                self.set_mode_client.call_async(req)
 
 def main(args=None):
     rclpy.init(args=args)
