@@ -6,11 +6,19 @@ Receives path commands and sends control setpoints to flight controller via MAVR
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, Bool
-from geometry_msgs.msg import TwistStamped
+from std_msgs.msg import Float64MultiArray, Bool
+from geometry_msgs.msg import TwistStamped, PoseStamped
 from mavros_msgs.msg import State
 import numpy as np
+import time
+import struct
+import zlib
 
+try:
+    from px4_msgs.msg import OffboardControlMode
+except ImportError:
+    OffboardControlMode = None
+    
 class CommandExecutorNode(Node):
     def __init__(self):
         super().__init__('command_executor')
@@ -22,15 +30,31 @@ class CommandExecutorNode(Node):
         self.current_waypoint_idx = 0
         self.waypoints = []
         self.mavros_state = None
+        self.current_pose = None
         self.last_command_time = self.get_clock().now()
         
         # Subscribers
-        self.create_subscription(Float32MultiArray, '/path_commands', self.path_callback, 10)
+        self.create_subscription(Float64MultiArray, '/path_commands', self.path_callback, 10)
         self.create_subscription(State, '/mavros/state', self.state_callback, 10)
         self.create_subscription(Bool, '/emergency_status', self.emergency_callback, 10)
         
         # Publishers
         self.velocity_pub = self.create_publisher(TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
+
+        if OffboardControlMode is not None:
+            self.offboard_mode_pub = self.create_publisher(
+                OffboardControlMode, '/mavros/offboard_control_mode', 10)
+        else:
+            self.offboard_mode_pub = None
+
+        # Fix #7 - ACK publisher
+        self.ack_pub = self.create_publisher(
+            Float64MultiArray, '/path_command_ack', 10)
+
+        # Fix #3 - pose subscription
+        self.create_subscription(
+            PoseStamped, '/mavros/local_position/pose',
+            self.pose_callback, 10)
         
         # Timer for setpoint publishing (20 Hz for MAVROS offboard mode)
         self.create_timer(0.05, self.publish_setpoint)
@@ -60,6 +84,11 @@ class CommandExecutorNode(Node):
         self.last_command_time = self.get_clock().now()
         
         self.get_logger().info(f'Received path: {num_waypoints} waypoints')
+        
+        # fix send ack back to planner
+        ack = Float64MultiArray()
+        ack.data = [float(sequence)]
+        self.ack_pub.publish(ack)
     
     def state_callback(self, msg):
         """Receive MAVROS state"""
@@ -70,9 +99,24 @@ class CommandExecutorNode(Node):
         if msg.data:
             self.get_logger().warn('Emergency stop activated!')
             self.waypoints = []
-    
+    def pose_callback(self, msg):
+        """Fix #3 - track actual drone position"""
+        self.current_pose = msg
+        
     def publish_setpoint(self):
         """Publish velocity setpoints at 20 Hz"""
+
+        # Fix #1 - OffboardControlMode heartbeat (PX4 only)
+        if self.offboard_mode_pub is not None:
+            om = OffboardControlMode()
+            om.position     = False
+            om.velocity     = True
+            om.acceleration = False
+            om.attitude     = False
+            om.body_rate    = False
+            om.timestamp    = int(self.get_clock().now().nanoseconds / 1000)
+            self.offboard_mode_pub.publish(om)
+            
         # Check if we have waypoints
         if not self.waypoints:
             # Publish zero velocity to maintain offboard mode
