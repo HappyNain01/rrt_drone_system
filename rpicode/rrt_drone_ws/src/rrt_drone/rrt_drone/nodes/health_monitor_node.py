@@ -7,10 +7,9 @@ Monitors system health and triggers emergency procedures
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float64MultiArray
 from sensor_msgs.msg import LaserScan
 from mavros_msgs.msg import State
-from geometry_msgs.msg import TwistStamped
 
 class HealthMonitorNode(Node):
     def __init__(self):
@@ -33,7 +32,7 @@ class HealthMonitorNode(Node):
         # Subscribers
         self.create_subscription(LaserScan, '/scan', self.lidar_callback, 10)
         self.create_subscription(State, '/mavros/state', self.mavros_state_callback, 10)
-        self.create_subscription(TwistStamped, '/mavros/setpoint_velocity/cmd_vel', self.command_callback, 10)
+        self.create_subscription(TwistStamped, '/path_commands', self.command_callback, 10)
         
         # Publishers
         self.health_pub = self.create_publisher(Bool, '/system_healthy', 10)
