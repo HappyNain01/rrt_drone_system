@@ -31,6 +31,7 @@ class CommandExecutorNode(Node):
         
         # Publishers
         self.velocity_pub = self.create_publisher(TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
+        self.offboard_mode_pub = self.create_publisher(OffboardControlMode, '/mavros/offboard_control_mode', 10)
         
         # Timer for setpoint publishing (20 Hz for MAVROS offboard mode)
         self.create_timer(0.05, self.publish_setpoint)
@@ -108,6 +109,13 @@ class CommandExecutorNode(Node):
         twist.twist.angular.x = 0.0
         twist.twist.angular.y = 0.0
         twist.twist.angular.z = 0.0
+
+        offboard_msg = OffboardControlMode()
+        offboard_msg.velocity = True # we use velocity control
+        offboard_msg.position = False
+        offboad_msg.timestamp = int(self.get_clock(),now().nanoseconds / 1000)
+
+        self.offboard_mode_pub.publish(offboard_msg)
         
         self.velocity_pub.publish(twist)
 
